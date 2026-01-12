@@ -4,21 +4,15 @@ ICANN CZDS (Centralized Zone Data Service) zone file collector and newly registe
 
 ## Features
 
-- ✅ Automatic zone file download from ICANN CZDS
-- ✅ Gzip compressed zone file parsing
-- ✅ MongoDB domain upsert (insert/update)
-- ✅ Newly registered domain detection (`first_seen` tracking)
-- ✅ Sync statistics (`zone_sync_stats` collection)
-- ✅ Scheduled automatic sync (APScheduler)
-- ✅ Memory usage monitoring
+- Automatic zone file download from ICANN CZDS
+- Gzip compressed zone file parsing
+- MongoDB domain upsert (insert/update)
+- Newly registered domain detection (`first_seen` tracking)
+- Sync statistics (`zone_sync_stats` collection)
+- Scheduled automatic sync (APScheduler)
+- Memory usage monitoring
 
 ## Installation
-
-### Requirements
-
-- Python 3.11+
-- MongoDB 5.0+
-- ICANN CZDS account
 
 ### Install Dependencies
 
