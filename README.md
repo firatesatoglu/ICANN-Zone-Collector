@@ -2,13 +2,16 @@
 
 ICANN CZDS (Centralized Zone Data Service) zone file collector and newly registered domain detection service.
 
+![API Documentation](docs/zone-collector-api-docs.png)
+
 ## Features
 
-- Automatic zone file download from ICANN CZDS
-- Gzip compressed zone file parsing
-- MongoDB domain upsert (insert/update)
+- **Parallel zone file download** from ICANN CZDS (configurable concurrency)
+- Gzip compressed zone file parsing (streaming, memory-efficient)
+- MongoDB domain upsert with bulk write operations
 - Newly registered domain detection (`first_seen` tracking)
 - Sync statistics (`zone_sync_stats` collection)
+- **Sync gap detection** for false positive prevention
 - Scheduled automatic sync (APScheduler)
 - Memory usage monitoring
 
@@ -31,22 +34,18 @@ pip install -r requirements.txt
 Create a `.env` file:
 
 ```bash
-# MongoDB
 MONGODB_URL=mongodb://user:pass@localhost:27017/
-MONGODB_DB=icann_tlds_db
+DATABASE_NAME=icann_tlds_db
 
-# ICANN CZDS Credentials
 ICANN_USERNAME=your_email@example.com
 ICANN_PASSWORD=your_password
 
-# Sync Schedule (Istanbul timezone)
-SCHEDULE_HOURS=6,12,18
-
-# Zone File Directory
+SCHEDULE_HOURS=0,12
 ZONE_FILES_DIR=./zonefiles
-```
 
-> ⚠️ **Docker ICANN_PASSWORD:** If your password contains `$`, escape it as `\$` or use single quotes.
+MAX_CONCURRENT_DOWNLOADS=10
+UPSERT_BATCH_SIZE=5000
+```
 
 ## Running
 
@@ -65,29 +64,22 @@ docker run -p 8002:8000 --env-file .env zone-collector
 
 ## API Endpoints
 
-### Health & Status
+### Health & Sync
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/` | GET | Swagger UI |
-| `/api/v1/health` | GET | Health check |
-| `/api/v1/sync/status` | GET | Active sync status |
-
-### Zone Sync
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/v1/sync` | POST | Start manual sync |
-| `/api/v1/sync/status/{sync_id}` | GET | Specific sync status |
+| `/health` | GET | Health check |
+| `/sync` | POST | Start manual sync |
+| `/sync/status` | GET | Current sync status |
 
 ### TLD Management
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/v1/tlds` | GET | List available TLDs |
-| `/api/v1/tlds/{tld}/stats` | GET | TLD statistics |
-| `/api/v1/tlds/{tld}/domains` | GET | TLD domains (paginated) |
-| `/api/v1/zones/links` | GET | Active zone file links |
+| `/tlds` | GET | List available TLDs |
+| `/tlds/{tld}/stats` | GET | TLD statistics |
+| `/tlds/{tld}/domains` | GET | TLD domains (paginated) |
+| `/zone-links` | GET | Available zone file links |
 
 ### Newly Registered Domains
 
@@ -96,60 +88,77 @@ docker run -p 8002:8000 --env-file .env zone-collector
 | `/newly-registered` | GET | Newly registered domains |
 | `/newly-registered/stats` | GET | Sync statistics |
 
-#### `/newly-registered` Parameters
+#### Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `days_back` | int | 7 | Days to look back (1-365) |
-| `tld` | str | null | TLD filter (optional) |
+| `tld` | str | null | TLD filter |
 | `page` | int | 1 | Page number |
 | `page_size` | int | 100 | Records per page |
 
-#### `/newly-registered/stats` Parameters
+## Performance Optimizations
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `days_back` | int | 7 | Days to look back (1-365) |
-| `tld` | str | null | TLD filter (optional) |
+### Parallel Processing
+
+TLDs are processed in parallel using `asyncio.Semaphore`:
+
+```python
+max_concurrent_downloads = 10  # Configurable
+```
+
+### Bulk Write Operations
+
+MongoDB writes use bulk operations:
+
+```python
+upsert_batch_size = 5000  # Configurable
+ordered = False  # Continues on error
+```
+
+### Streaming Parser
+
+Zone files are parsed line-by-line (no memory loading):
+
+```python
+for line in gzip.open(file, "rt"):
+    yield line  # Generator, not list
+```
 
 ## MongoDB Schema
 
 ### Domain Collections (`{tld}_tld`)
 
-Separate collection for each TLD:
-
 ```javascript
-// Collection: com_tld
 {
-  "_id": ObjectId("..."),
-  "domain": "example",           // Domain name (without TLD)
-  "first_seen": ISODate("..."),  // First seen date
-  "last_seen": ISODate("..."),   // Last seen date
-  "dns_records": { ... },        // DNS records (optional)
-  "metadata": {
-    "source": "icann_czds",
-    "zone_file_date": ISODate("...")
-  }
+  "domain": "example",
+  "fqdn": "example.com",
+  "first_seen": ISODate(),
+  "last_seen": ISODate(),
+  "dns_records": { "ns": [...], "a": [...] },
+  "metadata": { "source": "icann_czds" }
 }
-
-// Indexes
-{ "domain": 1 }         // Unique index
-{ "first_seen": -1 }    // For new domain queries
-{ "last_seen": -1 }     // For activity queries
 ```
 
 ### Sync Statistics (`zone_sync_stats`)
 
-Statistics for each sync operation:
+```javascript
+{
+  "tld": "com",
+  "inserted": 1500,
+  "updated": 500,
+  "sync_time": ISODate()
+}
+```
+
+### Sync Metadata (`zone_sync_metadata`)
 
 ```javascript
 {
-  "_id": ObjectId("..."),
   "tld": "com",
-  "inserted": 1500,              // New domains inserted
-  "updated": 500,                // Domains updated
-  "total_changes": 2000,         // Total changes
-  "sync_time": ISODate("...")    // Sync timestamp
+  "last_sync": ISODate(),
+  "domain_count": 150000000,
+  "sync_count": 42
 }
 ```
 
@@ -158,61 +167,14 @@ Statistics for each sync operation:
 ```
 zone-collector/
 ├── app/
-│   ├── main.py              # FastAPI app, lifespan, memory monitoring
+│   ├── main.py              # FastAPI app, memory monitoring
 │   ├── config.py            # Settings (Pydantic)
-│   ├── scheduler.py         # APScheduler scheduled tasks
-│   ├── api/
-│   │   └── routes.py        # API endpoints
-│   ├── database/
-│   │   └── mongodb.py       # MongoDB operations
+│   ├── scheduler.py         # APScheduler
+│   ├── api/routes.py        # API endpoints
+│   ├── database/mongodb.py  # MongoDB operations
 │   └── services/
-│       ├── icann_client.py  # ICANN CZDS API client
-│       ├── zone_parser.py   # Zone file parser
-│       └── sync_service.py  # Sync orchestration
-├── zonefiles/               # Downloaded zone files
-├── requirements.txt
-├── Dockerfile
-└── .env
+│       ├── czds_client.py   # ICANN API client
+│       ├── zone_parser.py   # Streaming parser
+│       └── sync_service.py  # Parallel sync orchestration
+└── requirements.txt
 ```
-
-## Sync Flow
-
-```mermaid
-sequenceDiagram
-    participant Scheduler
-    participant SyncService
-    participant ICANN
-    participant Parser
-    participant MongoDB
-
-    Scheduler->>SyncService: trigger_sync()
-    SyncService->>ICANN: authenticate()
-    ICANN-->>SyncService: JWT token
-    SyncService->>ICANN: get_zone_links()
-    ICANN-->>SyncService: zone file URLs
-    
-    loop For each TLD
-        SyncService->>ICANN: download_zone(url)
-        ICANN-->>SyncService: zone.gz
-        SyncService->>Parser: parse_zone_file()
-        Parser-->>SyncService: domains[]
-        SyncService->>MongoDB: upsert_domains()
-        MongoDB-->>SyncService: {inserted, updated}
-        SyncService->>MongoDB: save_sync_stats()
-    end
-```
-
-## Monitoring
-
-The service logs memory usage every 5 minutes:
-
-```
-📊 Memory Usage - Process: 69.1 MB (RSS), 425178.5 MB (VMS) | System: 5133/16384 MB available (68.7% used)
-```
-
-## Error Handling
-
-- ICANN authentication errors: 401/403 → retry with new token
-- Zone file download errors: Log and continue
-- MongoDB connection errors: Exponential backoff retry
-- Parse errors: Log and skip that TLD
