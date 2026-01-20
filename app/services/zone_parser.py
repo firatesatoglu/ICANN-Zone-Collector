@@ -1,10 +1,12 @@
 import gzip
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Generator, Tuple
 from dataclasses import dataclass, field
 import logging
 
 logger = logging.getLogger(__name__)
+
+CHUNK_SIZE = 50000
 
 
 @dataclass
@@ -34,20 +36,15 @@ class ZoneParser:
     """
     Parser for BIND zone files from ICANN CZDS.
     
-    Zone file format:
-    - Lines starting with ; are comments
-    - Each record line has: owner ttl class type rdata
-    
-    Example:
-    go.zara.        3600    in      ns      a1-253.akam.net.
-    a0.nic.zara.   3600    in      a       65.22.232.33
+    OPTIMIZED: Uses chunked parsing to avoid OOM on large files (1M+ domains).
     """
     
     RECORD_TYPES = {'ns', 'a', 'aaaa', 'ds'}
     
-    def __init__(self, file_path: Path):
+    def __init__(self, file_path: Path, chunk_size: int = CHUNK_SIZE):
         self.file_path = file_path
         self.tld = self._extract_tld()
+        self.chunk_size = chunk_size
     
     def _extract_tld(self) -> str:
         """Extract TLD from filename."""
@@ -70,24 +67,27 @@ class ZoneParser:
             logger.error(f"Error reading file {self.file_path}: {str(e)}")
             raise
     
-    def parse_domains(self) -> Dict[str, DomainRecord]:
+    def parse_domains_chunked(self) -> Generator[Tuple[Dict[str, DomainRecord], bool], None, None]:
         """
-        Parse zone file and extract ALL domains with their DNS records.
+        Parse zone file and yield chunks of domains.
         
-        Captures domains from any DNS record type in the zone file.
-        Returns dict mapping domain name to DomainRecord.
+        MEMORY OPTIMIZED: Yields chunks of chunk_size domains instead of loading all at once.
+        
+        Yields:
+            Tuple of (domains_dict, is_last_chunk)
         """
         domains: Dict[str, DomainRecord] = {}
         tld_suffix = f".{self.tld}."
         tld_suffix_lower = tld_suffix.lower()
         
         line_count = 0
+        total_domains = 0
         
         for line in self._read_file():
             line_count += 1
             
             if line_count % 1000000 == 0:
-                logger.info(f"Processed {line_count:,} lines, found {len(domains):,} unique domains")
+                logger.info(f"Processed {line_count:,} lines, found {total_domains:,} unique domains")
             
             line = line.strip()
             if not line or line.startswith(";"):
@@ -110,8 +110,10 @@ class ZoneParser:
                 if not domain or "." in domain:
                     continue
                 
-                if domain not in domains:
+                is_new = domain not in domains
+                if is_new:
                     domains[domain] = DomainRecord(domain=domain)
+                    total_domains += 1
                 
                 record = domains[domain]
                 
@@ -125,20 +127,52 @@ class ZoneParser:
                     ds_data = " ".join(parts[4:])
                     if ds_data not in record.ds:
                         record.ds.append(ds_data)
+                
+                if len(domains) >= self.chunk_size:
+                    logger.info(f"Yielding chunk of {len(domains):,} domains")
+                    yield domains, False
+                    domains = {}
+        
+        if domains:
+            yield domains, True
         
         logger.info(
             f"Parsed {self.file_path.name}: {line_count:,} lines, "
-            f"{len(domains):,} unique domains"
+            f"{total_domains:,} unique domains"
         )
-        
-        return domains
+    
+    def parse_domains(self) -> Dict[str, DomainRecord]:
+        """
+        Parse all domains at once (legacy method for small files).
+        WARNING: May cause OOM on large files.
+        """
+        all_domains = {}
+        for chunk, is_last in self.parse_domains_chunked():
+            all_domains.update(chunk)
+        return all_domains
 
 
-def parse_zone_file(file_path: Path) -> tuple[str, Dict[str, DomainRecord]]:
+def parse_zone_file(file_path: Path) -> Tuple[str, Dict[str, DomainRecord]]:
     """
-    Convenience function to parse a zone file.
+    Convenience function to parse a zone file (all at once).
     Returns tuple of (tld, domains_dict).
+    WARNING: Use parse_zone_file_chunked for large files.
     """
     parser = ZoneParser(file_path)
     domains = parser.parse_domains()
     return parser.tld, domains
+
+
+def parse_zone_file_chunked(
+    file_path: Path, 
+    chunk_size: int = CHUNK_SIZE
+) -> Generator[Tuple[str, Dict[str, DomainRecord], bool], None, None]:
+    """
+    Parse zone file in chunks (memory efficient).
+    
+    Yields:
+        Tuple of (tld, domains_dict, is_last_chunk)
+    """
+    parser = ZoneParser(file_path, chunk_size)
+    for chunk, is_last in parser.parse_domains_chunked():
+        yield parser.tld, chunk, is_last

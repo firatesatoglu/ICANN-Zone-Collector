@@ -6,7 +6,7 @@ import asyncio
 import uuid
 
 from app.services.czds_client import czds_client
-from app.services.zone_parser import parse_zone_file
+from app.services.zone_parser import parse_zone_file_chunked
 from app.database.mongodb import mongodb
 from app.config import settings
 from app.models.domain import SyncStatus
@@ -72,9 +72,35 @@ class SyncService:
                         status.errors.append(f"Failed to download {tld}")
                     return result
                 
-                parsed_tld, domains = parse_zone_file(file_path)
+                await mongodb.ensure_indexes(tld)
                 
-                if not domains:
+                total_domains = 0
+                total_inserted = 0
+                total_updated = 0
+                chunk_num = 0
+                
+                for parsed_tld, domains, is_last in parse_zone_file_chunked(file_path):
+                    chunk_num += 1
+                    chunk_size = len(domains)
+                    total_domains += chunk_size
+                    
+                    if not domains:
+                        continue
+                    
+                    upsert_result = await mongodb.upsert_domains(
+                        tld=tld,
+                        domains=domains,
+                        zone_file_date=datetime.utcnow()
+                    )
+                    
+                    total_inserted += upsert_result['inserted']
+                    total_updated += upsert_result['updated']
+                    
+                    del domains
+                    
+                    logger.debug(f"[{sync_id}] {tld} chunk {chunk_num}: {chunk_size:,} domains processed")
+                
+                if total_domains == 0:
                     logger.warning(f"[{sync_id}] No domains found in {tld}")
                     try:
                         file_path.unlink()
@@ -82,38 +108,30 @@ class SyncService:
                         pass
                     return result
                 
-                await mongodb.ensure_indexes(tld)
-                
-                upsert_result = await mongodb.upsert_domains(
-                    tld=tld,
-                    domains=domains,
-                    zone_file_date=datetime.utcnow()
-                )
-                
                 await mongodb.save_sync_stats(
                     tld=tld,
-                    inserted=upsert_result['inserted'],
-                    updated=upsert_result['updated']
+                    inserted=total_inserted,
+                    updated=total_updated
                 )
                 
-                await mongodb.save_sync_metadata(tld=tld, domain_count=len(domains))
+                await mongodb.save_sync_metadata(tld=tld, domain_count=total_domains)
                 
                 async with self._lock:
                     self._processed_count += 1
-                    self._total_domains += len(domains)
+                    self._total_domains += total_domains
                     status.tlds_processed = self._processed_count
                     status.total_domains_processed = self._total_domains
                     status.message = f"Processing... {self._processed_count} TLDs done"
                 
                 logger.info(
-                    f"[{sync_id}] Processed {tld}: {upsert_result['inserted']} new, "
-                    f"{upsert_result['updated']} updated, {len(domains):,} total"
+                    f"[{sync_id}] Processed {tld}: {total_inserted:,} new, "
+                    f"{total_updated:,} updated, {total_domains:,} total"
                 )
                 
                 result["success"] = True
-                result["domains"] = len(domains)
-                result["inserted"] = upsert_result['inserted']
-                result["updated"] = upsert_result['updated']
+                result["domains"] = total_domains
+                result["inserted"] = total_inserted
+                result["updated"] = total_updated
                 
                 try:
                     file_path.unlink()
