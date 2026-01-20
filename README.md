@@ -116,14 +116,18 @@ upsert_batch_size = 5000  # Configurable
 ordered = False  # Continues on error
 ```
 
-### Streaming Parser
+### Chunked Parsing (Memory Optimized)
 
-Zone files are parsed line-by-line (no memory loading):
+Large zone files (1M+ domains) are processed in 50K chunks to prevent OOM:
 
 ```python
-for line in gzip.open(file, "rt"):
-    yield line  # Generator, not list
+for tld, domains, is_last in parse_zone_file_chunked(file):
+    # Process 50K domains at a time
+    await mongodb.upsert_domains(tld, domains)
+    del domains  # Free memory
 ```
+
+This allows processing files like `vip.txt.gz` (1.5M domains) without OOM.
 
 ## MongoDB Schema
 
